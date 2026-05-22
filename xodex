@@ -1,0 +1,1905 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+STORE="${XODEX_STORE:-${CODEX_SWITCH_STORE:-$CODEX_HOME/profile-store}}"
+CURRENT_FILE="$STORE/.current"
+REFRESH_PID_FILE="$STORE/.refresh.pid"
+REFRESH_LOG_FILE="$STORE/.refresh.log"
+REFRESH_LOCK_FILE="$STORE/.refresh.lock"
+REFRESH_INTERVAL_SECONDS="${XODEX_REFRESH_INTERVAL_SECONDS:-${CODEX_SWITCH_REFRESH_INTERVAL_SECONDS:-21600}}"
+REFRESH_LOCK_MAX_AGE_SECONDS="${XODEX_REFRESH_LOCK_MAX_AGE_SECONDS:-${CODEX_SWITCH_REFRESH_LOCK_MAX_AGE_SECONDS:-3600}}"
+REFRESH_WINDOW_SECONDS="${XODEX_REFRESH_WINDOW_SECONDS:-${CODEX_SWITCH_REFRESH_WINDOW_SECONDS:-86400}}"
+REFRESH_ENABLED="${XODEX_REFRESH_ENABLED:-${CODEX_SWITCH_REFRESH_ENABLED:-1}}"
+CODEX_BIN="${XODEX_CODEX_BIN:-${CODEX_SWITCH_CODEX_BIN:-codex}}"
+CODEX_OAUTH_TOKEN_URL="${XODEX_OAUTH_TOKEN_URL:-${CODEX_SWITCH_OAUTH_TOKEN_URL:-https://auth.openai.com/oauth/token}}"
+CODEX_OAUTH_CLIENT_ID="${XODEX_OAUTH_CLIENT_ID:-${CODEX_SWITCH_OAUTH_CLIENT_ID:-app_EMoamEEZ73f0CkXaXp7hrann}}"
+QUOTA_PID_FILE="$STORE/.quota.pid"
+QUOTA_LOG_FILE="$STORE/.quota.log"
+QUOTA_DIR="$STORE/.quota"
+QUOTA_BAR_FILE="$STORE/.quota-bar"
+QUOTA_LOCK_FILE="$STORE/.quota.lock"
+QUOTA_INTERVAL_SECONDS="${XODEX_QUOTA_INTERVAL_SECONDS:-${CODEX_SWITCH_QUOTA_INTERVAL_SECONDS:-900}}"
+QUOTA_CACHE_MAX_AGE_SECONDS="${XODEX_QUOTA_CACHE_MAX_AGE_SECONDS:-${CODEX_SWITCH_QUOTA_CACHE_MAX_AGE_SECONDS:-900}}"
+QUOTA_LOCK_MAX_AGE_SECONDS="${XODEX_QUOTA_LOCK_MAX_AGE_SECONDS:-${CODEX_SWITCH_QUOTA_LOCK_MAX_AGE_SECONDS:-300}}"
+QUOTA_RESET_DROP_THRESHOLD_PERCENT="${XODEX_QUOTA_RESET_DROP_THRESHOLD_PERCENT:-${CODEX_SWITCH_QUOTA_RESET_DROP_THRESHOLD_PERCENT:-20}}"
+QUOTA_FETCH_TIMEOUT_SECONDS="${XODEX_QUOTA_FETCH_TIMEOUT_SECONDS:-${CODEX_SWITCH_QUOTA_FETCH_TIMEOUT_SECONDS:-15}}"
+QUOTA_BAR_ENABLED="${XODEX_QUOTA_BAR:-${CODEX_SWITCH_QUOTA_BAR:-auto}}"
+QUOTA_OVERLAY_ALIGN="${XODEX_QUOTA_OVERLAY_ALIGN:-${CODEX_SWITCH_QUOTA_OVERLAY_ALIGN:-right}}"
+QUOTA_OVERLAY_MAX_WIDTH="${XODEX_QUOTA_OVERLAY_MAX_WIDTH:-${CODEX_SWITCH_QUOTA_OVERLAY_MAX_WIDTH:-0}}"
+QUOTA_BASE_URL="${XODEX_QUOTA_BASE_URL:-${CODEX_SWITCH_QUOTA_BASE_URL:-https://chatgpt.com/backend-api}}"
+QUOTA_OVERLAY_STATE_FILE="$STORE/.quota-overlay"
+PROFILE_FILES=("auth.json")
+SHARED_FILES=("config.toml")
+
+usage() {
+  cat <<'EOF'
+Usage:
+  xodex                    Open Codex with the currently marked profile
+  xodex <name> [codex args...]  Switch to <name>, refresh other profiles, and open Codex
+  xodex run <name> [codex args...]
+  xodex save <name>          Save the current Codex profile as <name>
+  xodex use <name>           Switch active Codex profile to <name>
+  xodex new <name>           Create an empty profile and switch to it
+  xodex refresh [name]       Refresh saved ChatGPT tokens once
+  xodex refresh-status       Show background refresh status
+  xodex quota [name]         Fetch saved profile quota once
+  xodex quota-status         Show background quota monitor status
+  xodex list                 List saved profiles
+  xodex current              Show the currently marked profile
+  xodex where                Show Codex home and profile store paths
+
+Notes:
+  - A profile contains only auth.json, which holds the OpenAI login.
+  - Empty profiles intentionally contain no auth.json and behave as logged out.
+  - xodex <name> leaves Codex in the foreground and refreshes the other
+    saved ChatGPT-token profiles in the background.
+  - xodex with no arguments opens Codex with the currently marked
+    profile.
+  - In an interactive terminal, xodex <name> overlays a top quota badge
+    showing current and saved profile quota and reset dates.
+  - config.toml is shared and is never changed by this script.
+  - Existing sessions, session indexes, logs, sqlite state, memories, plugins,
+    rules, and caches stay in the active CODEX_HOME.
+  - Before switching, the currently marked profile is saved automatically.
+EOF
+}
+
+die() {
+  printf 'xodex: %s\n' "$*" >&2
+  exit 1
+}
+
+log_refresh() {
+  printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >&2
+}
+
+decode_base64() {
+  if base64 --help 2>&1 | grep -q -- '--decode'; then
+    base64 --decode
+  else
+    base64 -D
+  fi
+}
+
+positive_int_or_default() {
+  local value="$1"
+  local default="$2"
+
+  case "$value" in
+    ""|*[!0-9]*)
+      printf '%s\n' "$default"
+      ;;
+    0)
+      printf '%s\n' "$default"
+      ;;
+    *)
+      printf '%s\n' "$value"
+      ;;
+  esac
+}
+
+refresh_interval_seconds() {
+  positive_int_or_default "$REFRESH_INTERVAL_SECONDS" 21600
+}
+
+refresh_window_seconds() {
+  positive_int_or_default "$REFRESH_WINDOW_SECONDS" 86400
+}
+
+refresh_lock_max_age_seconds() {
+  positive_int_or_default "$REFRESH_LOCK_MAX_AGE_SECONDS" 3600
+}
+
+quota_interval_seconds() {
+  positive_int_or_default "$QUOTA_INTERVAL_SECONDS" 900
+}
+
+quota_cache_max_age_seconds() {
+  positive_int_or_default "$QUOTA_CACHE_MAX_AGE_SECONDS" 900
+}
+
+quota_lock_max_age_seconds() {
+  positive_int_or_default "$QUOTA_LOCK_MAX_AGE_SECONDS" 300
+}
+
+quota_reset_drop_threshold_percent() {
+  positive_int_or_default "$QUOTA_RESET_DROP_THRESHOLD_PERCENT" 20
+}
+
+quota_fetch_timeout_seconds() {
+  positive_int_or_default "$QUOTA_FETCH_TIMEOUT_SECONDS" 15
+}
+
+quota_overlay_max_width() {
+  positive_int_or_default "$QUOTA_OVERLAY_MAX_WIDTH" 0
+}
+
+terminal_cols() {
+  local size
+  local cols=""
+
+  size="$(stty size </dev/tty 2>/dev/null || true)"
+  case "$size" in
+    *" "*)
+      cols="${size##* }"
+      ;;
+  esac
+  case "$cols" in
+    ""|*[!0-9]*)
+      cols="${COLUMNS:-}"
+      ;;
+  esac
+  case "$cols" in
+    ""|*[!0-9]*)
+      cols="$(tput cols </dev/tty 2>/dev/null || printf '80')"
+      ;;
+  esac
+  case "$cols" in
+    ""|*[!0-9]*)
+      cols=80
+      ;;
+  esac
+
+  printf '%s\n' "$cols"
+}
+
+now_epoch() {
+  date -u '+%s'
+}
+
+utc_now() {
+  date -u '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+rfc3339_to_epoch() {
+  local value="$1"
+  local clean
+
+  [ -n "$value" ] || return 1
+  clean="${value%Z}"
+  clean="${clean%%.*}"
+  clean="${clean}Z"
+
+  if date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$clean" '+%s' >/dev/null 2>&1; then
+    date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$clean" '+%s'
+  elif date -u -d "$clean" '+%s' >/dev/null 2>&1; then
+    date -u -d "$clean" '+%s'
+  else
+    return 1
+  fi
+}
+
+epoch_to_local_label() {
+  local epoch="$1"
+
+  case "$epoch" in
+    ""|*[!0-9]*)
+      printf 'unknown\n'
+      return
+      ;;
+  esac
+
+  if date -r "$epoch" '+%b %d %H:%M' >/dev/null 2>&1; then
+    date -r "$epoch" '+%b %d %H:%M'
+  elif date -d "@$epoch" '+%b %d %H:%M' >/dev/null 2>&1; then
+    date -d "@$epoch" '+%b %d %H:%M'
+  else
+    printf '%s\n' "$epoch"
+  fi
+}
+
+require_codex_home() {
+  [ -d "$CODEX_HOME" ] || die "Codex home does not exist: $CODEX_HOME"
+}
+
+require_profile_name() {
+  local name="${1:-}"
+
+  [ -n "$name" ] || die "missing profile name"
+  case "$name" in
+    *[!A-Za-z0-9._-]*)
+      die "invalid profile name: $name"
+      ;;
+  esac
+}
+
+ensure_store() {
+  mkdir -p "$STORE/.backups"
+  mkdir -p "$QUOTA_DIR"
+  chmod 700 "$STORE"
+  chmod 700 "$QUOTA_DIR"
+}
+
+profile_dir() {
+  printf '%s/%s\n' "$STORE" "$1"
+}
+
+profile_exists() {
+  local name="$1"
+
+  case "$name" in
+    ""|*[!A-Za-z0-9._-]*)
+      return 1
+      ;;
+  esac
+
+  [ -d "$(profile_dir "$name")" ]
+}
+
+copy_private_file() {
+  local source="$1"
+  local target="$2"
+  local tmp
+
+  tmp="${target}.tmp.$$"
+  cp "$source" "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$target"
+}
+
+write_meta() {
+  local name="$1"
+  local target="$2"
+
+  {
+    printf 'name=%s\n' "$name"
+    printf 'saved_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf 'codex_home=%s\n' "$CODEX_HOME"
+    printf 'files=%s\n' "${PROFILE_FILES[*]}"
+    printf 'shared_files=%s\n' "${SHARED_FILES[*]}"
+  } > "$target/profile.meta"
+  chmod 600 "$target/profile.meta"
+}
+
+save_profile() {
+  local name="$1"
+  local allow_empty="${2:-0}"
+  local target
+  local copied=0
+  local file
+
+  require_profile_name "$name"
+  require_codex_home
+  ensure_store
+
+  target="$(profile_dir "$name")"
+  mkdir -p "$target"
+  chmod 700 "$target"
+
+  for file in "${PROFILE_FILES[@]}"; do
+    if [ -f "$CODEX_HOME/$file" ]; then
+      copy_private_file "$CODEX_HOME/$file" "$target/$file"
+      copied=$((copied + 1))
+    elif [ "$allow_empty" = "1" ]; then
+      rm -f "$target/$file"
+    fi
+  done
+
+  for file in "${SHARED_FILES[@]}"; do
+    rm -f "$target/$file"
+  done
+
+  if [ "$copied" -eq 0 ] && [ "$allow_empty" != "1" ]; then
+    die "no profile files found in $CODEX_HOME"
+  fi
+  write_meta "$name" "$target"
+  printf '%s\n' "$name" > "$CURRENT_FILE"
+  chmod 600 "$CURRENT_FILE"
+  if [ "$copied" -gt 0 ]; then
+    printf 'Saved current Codex profile as %s\n' "$name"
+  else
+    printf 'Saved empty Codex profile as %s\n' "$name"
+  fi
+}
+
+backup_active_profile_files() {
+  local stamp
+  local backup_dir
+  local file
+  local copied=0
+  local suffix=1
+
+  stamp="$(date -u '+%Y%m%dT%H%M%SZ')"
+  backup_dir="$STORE/.backups/$stamp"
+
+  while [ -e "$backup_dir" ]; do
+    suffix=$((suffix + 1))
+    backup_dir="$STORE/.backups/$stamp-$suffix"
+  done
+
+  mkdir "$backup_dir"
+  chmod 700 "$backup_dir"
+
+  for file in "${PROFILE_FILES[@]}"; do
+    if [ -f "$CODEX_HOME/$file" ]; then
+      copy_private_file "$CODEX_HOME/$file" "$backup_dir/$file"
+      copied=$((copied + 1))
+    fi
+  done
+
+  if [ "$copied" -gt 0 ]; then
+    printf 'Backed up active profile files to %s\n' "$backup_dir"
+  else
+    rmdir "$backup_dir"
+  fi
+}
+
+autosave_current_profile() {
+  local current=""
+
+  [ -f "$CURRENT_FILE" ] && current="$(cat "$CURRENT_FILE")"
+  [ -n "$current" ] || return 0
+  [ -d "$(profile_dir "$current")" ] || return 0
+
+  save_profile "$current" 1 >/dev/null
+}
+
+use_profile() {
+  local name="$1"
+  local source
+  local file
+  local copied=0
+
+  require_profile_name "$name"
+  require_codex_home
+  ensure_store
+
+  source="$(profile_dir "$name")"
+  [ -d "$source" ] || die "unknown profile: $name"
+
+  autosave_current_profile
+  backup_active_profile_files
+
+  for file in "${PROFILE_FILES[@]}"; do
+    if [ -f "$source/$file" ]; then
+      copy_private_file "$source/$file" "$CODEX_HOME/$file"
+      copied=$((copied + 1))
+    else
+      rm -f "$CODEX_HOME/$file"
+    fi
+  done
+
+  printf '%s\n' "$name" > "$CURRENT_FILE"
+  chmod 600 "$CURRENT_FILE"
+  printf 'Switched Codex profile to %s\n' "$name"
+  if [ "$copied" -eq 0 ]; then
+    printf 'Profile has no auth.json; active OpenAI login cleared.\n'
+  fi
+  printf 'Shared config kept in place: %s/config.toml\n' "$CODEX_HOME"
+  printf 'Sessions kept in place: %s/sessions\n' "$CODEX_HOME"
+}
+
+jwt_exp_from_auth() {
+  local auth_file="$1"
+  local token
+  local payload
+  local remainder
+
+  token="$(jq -r '.tokens.access_token // empty' "$auth_file" 2>/dev/null)" || return 1
+  [ -n "$token" ] || return 1
+  payload="${token#*.}"
+  [ "$payload" != "$token" ] || return 1
+  payload="${payload%%.*}"
+  [ -n "$payload" ] || return 1
+
+  payload="${payload//-/+}"
+  payload="${payload//_//}"
+  remainder=$((${#payload} % 4))
+  case "$remainder" in
+    0) ;;
+    2) payload="${payload}==" ;;
+    3) payload="${payload}=" ;;
+    *) return 1 ;;
+  esac
+
+  printf '%s' "$payload" | decode_base64 2>/dev/null | jq -er '.exp // empty' 2>/dev/null
+}
+
+auth_has_refresh_token() {
+  local auth_file="$1"
+
+  [ -f "$auth_file" ] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  jq -e '((.tokens.refresh_token // "") | length) > 0' "$auth_file" >/dev/null 2>&1
+}
+
+auth_needs_refresh() {
+  local auth_file="$1"
+  local now
+  local last_refresh
+  local last_epoch
+  local access_exp
+  local interval
+  local window
+
+  auth_has_refresh_token "$auth_file" || return 1
+
+  now="$(now_epoch)"
+  interval="$(refresh_interval_seconds)"
+  window="$(refresh_window_seconds)"
+
+  last_refresh="$(jq -r '.last_refresh // empty' "$auth_file" 2>/dev/null || true)"
+  if [ -z "$last_refresh" ]; then
+    return 0
+  fi
+
+  last_epoch="$(rfc3339_to_epoch "$last_refresh" 2>/dev/null || true)"
+  if [ -z "$last_epoch" ]; then
+    return 0
+  fi
+
+  if [ $((now - last_epoch)) -ge "$interval" ]; then
+    return 0
+  fi
+
+  access_exp="$(jwt_exp_from_auth "$auth_file" 2>/dev/null || true)"
+  if [ -n "$access_exp" ] && [ $((access_exp - now)) -le "$window" ]; then
+    return 0
+  fi
+
+  return 1
+}
+
+refresh_auth_file() {
+  local auth_file="$1"
+  local label="${2:-$1}"
+  local refresh_token
+  local token_file
+  local request_file
+  local response_file
+  local tmp_file
+  local now
+
+  command -v jq >/dev/null 2>&1 || {
+    log_refresh "Skipping $label: jq is not installed"
+    return 1
+  }
+  command -v curl >/dev/null 2>&1 || {
+    log_refresh "Skipping $label: curl is not installed"
+    return 1
+  }
+
+  refresh_token="$(jq -r '.tokens.refresh_token // empty' "$auth_file" 2>/dev/null)" || {
+    log_refresh "Skipping $label: auth.json is not valid JSON"
+    return 1
+  }
+  [ -n "$refresh_token" ] || {
+    log_refresh "Skipping $label: no refresh token"
+    return 1
+  }
+
+  token_file="${auth_file}.refresh-token.$$"
+  request_file="${auth_file}.refresh-request.$$"
+  response_file="${auth_file}.refresh-response.$$"
+  tmp_file="${auth_file}.tmp.$$"
+
+  rm -f "$token_file" "$request_file" "$response_file" "$tmp_file"
+  (
+    umask 077
+    printf '%s' "$refresh_token" > "$token_file"
+    : > "$response_file"
+  )
+  if ! jq -n --arg client_id "$CODEX_OAUTH_CLIENT_ID" --rawfile refresh_token "$token_file" \
+    '{client_id: $client_id, grant_type: "refresh_token", refresh_token: $refresh_token}' \
+    > "$request_file"; then
+    rm -f "$token_file" "$request_file" "$response_file" "$tmp_file"
+    log_refresh "Failed to build refresh request for $label"
+    return 1
+  fi
+  chmod 600 "$request_file"
+
+  if ! curl -fsS --retry 2 --connect-timeout 10 --max-time 30 \
+    -X POST "$CODEX_OAUTH_TOKEN_URL" \
+    -H 'Content-Type: application/json' \
+    --data "@$request_file" \
+    -o "$response_file"; then
+    rm -f "$token_file" "$request_file" "$response_file" "$tmp_file"
+    log_refresh "Failed to refresh $label"
+    return 1
+  fi
+
+  now="$(utc_now)"
+  if ! jq -e --slurpfile refreshed "$response_file" --arg now "$now" '
+    ($refreshed[0]) as $r
+    | if ((($r.access_token // "") | length) == 0) then error("missing access_token") else . end
+    | .auth_mode = "chatgpt"
+    | .tokens.access_token = $r.access_token
+    | .tokens.refresh_token = ($r.refresh_token // .tokens.refresh_token)
+    | .tokens.id_token = ($r.id_token // .tokens.id_token)
+    | .tokens.account_id = ($r.account_id // .tokens.account_id)
+    | .last_refresh = $now
+  ' "$auth_file" > "$tmp_file"; then
+    rm -f "$token_file" "$request_file" "$response_file" "$tmp_file"
+    log_refresh "Failed to apply refreshed token response for $label"
+    return 1
+  fi
+
+  chmod 600 "$tmp_file"
+  mv "$tmp_file" "$auth_file"
+  rm -f "$token_file" "$request_file" "$response_file"
+  log_refresh "Refreshed $label"
+}
+
+refresh_profile() {
+  local name="$1"
+  local force="${2:-0}"
+  local auth_file
+
+  require_profile_name "$name"
+  auth_file="$(profile_dir "$name")/auth.json"
+  [ -f "$auth_file" ] || {
+    log_refresh "Skipping $name: no auth.json"
+    return 0
+  }
+  auth_has_refresh_token "$auth_file" || {
+    log_refresh "Skipping $name: no ChatGPT refresh token"
+    return 0
+  }
+
+  if [ "$force" = "1" ] || auth_needs_refresh "$auth_file"; then
+    refresh_auth_file "$auth_file" "$name"
+  else
+    log_refresh "Skipping $name: token is fresh"
+  fi
+}
+
+refresh_saved_profiles_once() {
+  local requested="${1:-}"
+  local skip_active="${2:-0}"
+  local active=""
+  local entry
+  local name
+  local found=0
+  local status=0
+
+  ensure_store
+  if [ -n "$requested" ]; then
+    require_profile_name "$requested"
+    [ -d "$(profile_dir "$requested")" ] || die "unknown profile: $requested"
+  fi
+
+  if ! acquire_refresh_lock; then
+    return 0
+  fi
+
+  [ -f "$CURRENT_FILE" ] && active="$(cat "$CURRENT_FILE")"
+
+  if [ -n "$requested" ]; then
+    refresh_profile "$requested" 1 || status=$?
+    release_refresh_lock
+    return "$status"
+  fi
+
+  for entry in "$STORE"/*; do
+    [ -d "$entry" ] || continue
+    name="$(basename "$entry")"
+    [ "$name" = ".backups" ] && continue
+    if [ "$skip_active" = "1" ] && [ "$name" = "$active" ]; then
+      continue
+    fi
+    found=1
+    refresh_profile "$name" 0 || status=$?
+  done
+
+  [ "$found" -eq 1 ] || log_refresh "No saved profiles in $STORE"
+  release_refresh_lock
+  return "$status"
+}
+
+quota_endpoint() {
+  local base="$QUOTA_BASE_URL"
+
+  while [ "${base%/}" != "$base" ]; do
+    base="${base%/}"
+  done
+
+  case "$base" in
+    *"/backend-api"*)
+      printf '%s/wham/usage\n' "$base"
+      ;;
+    *)
+      printf '%s/api/codex/usage\n' "$base"
+      ;;
+  esac
+}
+
+jwt_bool_claim_from_auth() {
+  local auth_file="$1"
+  local token
+  local payload
+  local remainder
+  local jq_filter="$2"
+
+  token="$(jq -r '.tokens.id_token // empty' "$auth_file" 2>/dev/null)" || return 1
+  [ -n "$token" ] || return 1
+  payload="${token#*.}"
+  [ "$payload" != "$token" ] || return 1
+  payload="${payload%%.*}"
+  [ -n "$payload" ] || return 1
+
+  payload="${payload//-/+}"
+  payload="${payload//_//}"
+  remainder=$((${#payload} % 4))
+  case "$remainder" in
+    0) ;;
+    2) payload="${payload}==" ;;
+    3) payload="${payload}=" ;;
+    *) return 1 ;;
+  esac
+
+  printf '%s' "$payload" | decode_base64 2>/dev/null | jq -er "$jq_filter" 2>/dev/null
+}
+
+auth_is_fedramp_account() {
+  local auth_file="$1"
+
+  jwt_bool_claim_from_auth "$auth_file" \
+    '.["https://api.openai.com/auth"].chatgpt_account_is_fedramp // false' \
+    2>/dev/null || printf 'false\n'
+}
+
+write_quota_cache_error() {
+  local name="$1"
+  local message="$2"
+  local target="$QUOTA_DIR/$name.json"
+  local tmp="$target.tmp.$$"
+
+  if command -v jq >/dev/null 2>&1; then
+    jq -n \
+      --arg profile "$name" \
+      --arg fetched_at "$(utc_now)" \
+      --arg message "$message" \
+      '{profile: $profile, fetched_at: $fetched_at, status: "error", message: $message}' \
+      > "$tmp"
+  else
+    printf '{"profile":"%s","fetched_at":"%s","status":"error","message":"%s"}\n' \
+      "$name" "$(utc_now)" "$message" > "$tmp"
+  fi
+  chmod 600 "$tmp"
+  mv "$tmp" "$target"
+}
+
+write_quota_cache_from_payload() {
+  local name="$1"
+  local response_file="$2"
+  local target="$QUOTA_DIR/$name.json"
+  local tmp="$target.tmp.$$"
+  local normalized_file="$target.normalized.$$"
+  local alert_file="$target.alert.$$"
+  local reset_at
+  local reset_label
+
+  if ! jq -e --arg profile "$name" --arg fetched_at "$(utc_now)" '
+    def window_entries:
+      [
+        {kind: "primary", window: .rate_limit.primary_window},
+        {kind: "secondary", window: .rate_limit.secondary_window}
+      ] | map(select(.window != null));
+    def weekly_window:
+      window_entries
+      | map(select((.window.limit_window_seconds // 0) >= 574560 and (.window.limit_window_seconds // 0) <= 635040))
+      | .[0];
+    def selected_window:
+      weekly_window
+      // (window_entries | map(select(.kind == "secondary")) | .[0])
+      // (window_entries | .[0]);
+
+    selected_window as $selected
+    | if $selected == null then
+        {
+          profile: $profile,
+          fetched_at: $fetched_at,
+          status: "missing",
+          plan_type: (.plan_type // null)
+        }
+      else
+        (($selected.window.used_percent // 0) | tonumber) as $used
+        | {
+            profile: $profile,
+            fetched_at: $fetched_at,
+            status: "ok",
+            plan_type: (.plan_type // null),
+            window_kind: $selected.kind,
+            window_seconds: ($selected.window.limit_window_seconds // null),
+            window_label:
+              (if (($selected.window.limit_window_seconds // 0) >= 574560 and ($selected.window.limit_window_seconds // 0) <= 635040) then "weekly"
+               elif (($selected.window.limit_window_seconds // 0) >= 17100 and ($selected.window.limit_window_seconds // 0) <= 18900) then "5h"
+               elif (($selected.window.limit_window_seconds // 0) >= 82080 and ($selected.window.limit_window_seconds // 0) <= 90720) then "daily"
+               elif (($selected.window.limit_window_seconds // 0) >= 2462400 and ($selected.window.limit_window_seconds // 0) <= 2721600) then "monthly"
+               else "quota" end),
+            used_percent: $used,
+            remaining_percent: ([100, ([0, (100 - $used)] | max)] | min),
+            reset_at: ($selected.window.reset_at // null)
+          }
+      end
+  ' "$response_file" > "$normalized_file"; then
+    rm -f "$normalized_file" "$tmp"
+    write_quota_cache_error "$name" "invalid quota response"
+    return 1
+  fi
+
+  reset_at="$(jq -r '.reset_at // empty' "$normalized_file")"
+  reset_label="$(epoch_to_local_label "$reset_at")"
+  if [ -f "$target" ]; then
+    jq -n \
+      --slurpfile old "$target" \
+      --slurpfile new "$normalized_file" \
+      --arg now "$(utc_now)" \
+      --argjson now_epoch "$(now_epoch)" \
+      --argjson threshold "$(quota_reset_drop_threshold_percent)" '
+        ($old[0] // {}) as $o
+        | ($new[0] // {}) as $n
+        | ($o.reset_alert // null) as $previous_alert
+        | ($o.used_percent // null) as $old_used
+        | ($n.used_percent // null) as $new_used
+        | ($o.reset_at // 0) as $old_reset
+        | ($o.window_label // "") as $old_label
+        | ($n.window_label // "") as $new_label
+        | if (
+            ($o.status == "ok")
+            and ($n.status == "ok")
+            and ($old_used != null)
+            and ($new_used != null)
+            and (($old_used - $new_used) >= $threshold)
+            and ($old_reset > ($now_epoch + 60))
+            and ($old_label == $new_label)
+          ) then
+            {
+              active: true,
+              detected_at: $now,
+              previous_used_percent: $old_used,
+              new_used_percent: $new_used,
+              previous_reset_at: $old_reset
+            }
+          elif (($previous_alert.active // false) == true) then
+            $previous_alert
+          else
+            null
+          end
+      ' > "$alert_file"
+  else
+    printf 'null\n' > "$alert_file"
+  fi
+  jq --slurpfile alert "$alert_file" --arg reset_label "$reset_label" '
+    .reset_label = $reset_label
+    | if $alert[0] == null then del(.reset_alert) else .reset_alert = $alert[0] end
+  ' "$normalized_file" > "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$target"
+  rm -f "$normalized_file" "$alert_file"
+}
+
+quota_cache_is_fresh() {
+  local name="$1"
+  local file="$QUOTA_DIR/$name.json"
+  local fetched_at
+  local fetched_epoch
+  local age
+
+  [ -f "$file" ] || return 1
+  fetched_at="$(jq -r '.fetched_at // empty' "$file" 2>/dev/null || true)"
+  [ -n "$fetched_at" ] || return 1
+  fetched_epoch="$(rfc3339_to_epoch "$fetched_at" 2>/dev/null || true)"
+  [ -n "$fetched_epoch" ] || return 1
+  age=$(($(now_epoch) - fetched_epoch))
+  [ "$age" -lt "$(quota_cache_max_age_seconds)" ]
+}
+
+read_quota_lock_field() {
+  local key="$1"
+  local line
+
+  [ -f "$QUOTA_LOCK_FILE" ] || return 1
+  while IFS= read -r line; do
+    case "$line" in
+      "$key="*)
+        printf '%s\n' "${line#*=}"
+        return 0
+        ;;
+    esac
+  done < "$QUOTA_LOCK_FILE"
+
+  return 1
+}
+
+acquire_quota_lock() {
+  local now
+  local max_age
+  local lock_created
+  local lock_pid
+  local lock_owner
+  local age
+
+  ensure_store
+  max_age="$(quota_lock_max_age_seconds)"
+
+  while true; do
+    now="$(now_epoch)"
+    QUOTA_LOCK_OWNER="$$:${BASHPID:-$$}:$RANDOM:$now"
+    if (
+      set -o noclobber
+      umask 077
+      {
+        printf 'owner=%s\n' "$QUOTA_LOCK_OWNER"
+        printf 'pid=%s\n' "$$"
+        printf 'created_at=%s\n' "$now"
+      } > "$QUOTA_LOCK_FILE"
+    ) 2>/dev/null; then
+      return 0
+    fi
+
+    lock_created="$(read_quota_lock_field created_at 2>/dev/null || true)"
+    lock_pid="$(read_quota_lock_field pid 2>/dev/null || true)"
+    lock_owner="$(read_quota_lock_field owner 2>/dev/null || true)"
+
+    case "$lock_created" in
+      ""|*[!0-9]*)
+        age="$max_age"
+        ;;
+      *)
+        age=$((now - lock_created))
+        ;;
+    esac
+
+    if [ "$age" -ge "$max_age" ]; then
+      rm -f "$QUOTA_LOCK_FILE"
+      continue
+    fi
+
+    log_refresh "Quota refresh already running owner=${lock_owner:-unknown} pid=${lock_pid:-unknown} age=${age}s"
+    return 1
+  done
+}
+
+release_quota_lock() {
+  local lock_owner
+
+  [ -f "$QUOTA_LOCK_FILE" ] || return 0
+  lock_owner="$(read_quota_lock_field owner 2>/dev/null || true)"
+  if [ -n "${QUOTA_LOCK_OWNER:-}" ] && [ "$lock_owner" = "$QUOTA_LOCK_OWNER" ]; then
+    rm -f "$QUOTA_LOCK_FILE"
+  fi
+}
+
+fetch_quota_for_profile() {
+  local name="$1"
+  local auth_file
+  local access_token
+  local account_id
+  local is_fedramp
+  local endpoint
+  local curl_config
+  local response_file
+  local status_file
+  local http_code
+  local timeout
+
+  require_profile_name "$name"
+  if quota_cache_is_fresh "$name"; then
+    return 0
+  fi
+
+  auth_file="$(profile_dir "$name")/auth.json"
+  [ -f "$auth_file" ] || {
+    write_quota_cache_error "$name" "no auth.json"
+    return 0
+  }
+  command -v jq >/dev/null 2>&1 || {
+    write_quota_cache_error "$name" "jq is not installed"
+    return 1
+  }
+  command -v curl >/dev/null 2>&1 || {
+    write_quota_cache_error "$name" "curl is not installed"
+    return 1
+  }
+
+  access_token="$(jq -r '.tokens.access_token // empty' "$auth_file" 2>/dev/null)" || {
+    write_quota_cache_error "$name" "invalid auth.json"
+    return 1
+  }
+  [ -n "$access_token" ] || {
+    write_quota_cache_error "$name" "no ChatGPT access token"
+    return 0
+  }
+
+  account_id="$(jq -r '.tokens.account_id // empty' "$auth_file" 2>/dev/null || true)"
+  is_fedramp="$(auth_is_fedramp_account "$auth_file")"
+  endpoint="$(quota_endpoint)"
+  timeout="$(quota_fetch_timeout_seconds)"
+  curl_config="$QUOTA_DIR/$name.curl-config.$$"
+  response_file="$QUOTA_DIR/$name.response.$$"
+  status_file="$QUOTA_DIR/$name.status.$$"
+
+  rm -f "$curl_config" "$response_file" "$status_file"
+  (
+    umask 077
+    {
+      printf 'url = "%s"\n' "$endpoint"
+      printf 'request = "GET"\n'
+      printf 'silent\n'
+      printf 'show-error\n'
+      printf 'connect-timeout = 10\n'
+      printf 'max-time = %s\n' "$timeout"
+      printf 'output = "%s"\n' "$response_file"
+      printf 'header = "Authorization: Bearer %s"\n' "$access_token"
+      printf 'header = "User-Agent: codex-cli"\n'
+      if [ -n "$account_id" ]; then
+        printf 'header = "ChatGPT-Account-ID: %s"\n' "$account_id"
+      fi
+      if [ "$is_fedramp" = "true" ]; then
+        printf 'header = "X-OpenAI-Fedramp: true"\n'
+      fi
+    } > "$curl_config"
+  )
+
+  if ! curl -K "$curl_config" -w '%{http_code}' > "$status_file"; then
+    rm -f "$curl_config" "$response_file" "$status_file"
+    write_quota_cache_error "$name" "quota request failed"
+    return 1
+  fi
+
+  http_code="$(cat "$status_file")"
+  if [ "$http_code" = "401" ]; then
+    rm -f "$curl_config" "$response_file" "$status_file"
+    refresh_saved_profiles_once "$name" 0 >/dev/null 2>&1 || true
+    fetch_quota_for_profile_after_refresh "$name"
+    return
+  fi
+
+  case "$http_code" in
+    2??)
+      write_quota_cache_from_payload "$name" "$response_file"
+      ;;
+    *)
+      write_quota_cache_error "$name" "quota request returned HTTP $http_code"
+      ;;
+  esac
+
+  rm -f "$curl_config" "$response_file" "$status_file"
+}
+
+fetch_quota_for_profile_after_refresh() {
+  local name="$1"
+  local auth_file
+  local access_token
+
+  auth_file="$(profile_dir "$name")/auth.json"
+  access_token="$(jq -r '.tokens.access_token // empty' "$auth_file" 2>/dev/null || true)"
+  [ -n "$access_token" ] || {
+    write_quota_cache_error "$name" "no ChatGPT access token after refresh"
+    return 1
+  }
+  fetch_quota_for_profile_no_retry "$name"
+}
+
+fetch_quota_for_profile_no_retry() {
+  local name="$1"
+  local auth_file
+  local access_token
+  local account_id
+  local is_fedramp
+  local endpoint
+  local curl_config
+  local response_file
+  local status_file
+  local http_code
+  local timeout
+
+  auth_file="$(profile_dir "$name")/auth.json"
+  access_token="$(jq -r '.tokens.access_token // empty' "$auth_file" 2>/dev/null || true)"
+  account_id="$(jq -r '.tokens.account_id // empty' "$auth_file" 2>/dev/null || true)"
+  is_fedramp="$(auth_is_fedramp_account "$auth_file")"
+  endpoint="$(quota_endpoint)"
+  timeout="$(quota_fetch_timeout_seconds)"
+  curl_config="$QUOTA_DIR/$name.curl-config.$$"
+  response_file="$QUOTA_DIR/$name.response.$$"
+  status_file="$QUOTA_DIR/$name.status.$$"
+
+  rm -f "$curl_config" "$response_file" "$status_file"
+  (
+    umask 077
+    {
+      printf 'url = "%s"\n' "$endpoint"
+      printf 'request = "GET"\n'
+      printf 'silent\n'
+      printf 'show-error\n'
+      printf 'connect-timeout = 10\n'
+      printf 'max-time = %s\n' "$timeout"
+      printf 'output = "%s"\n' "$response_file"
+      printf 'header = "Authorization: Bearer %s"\n' "$access_token"
+      printf 'header = "User-Agent: codex-cli"\n'
+      if [ -n "$account_id" ]; then
+        printf 'header = "ChatGPT-Account-ID: %s"\n' "$account_id"
+      fi
+      if [ "$is_fedramp" = "true" ]; then
+        printf 'header = "X-OpenAI-Fedramp: true"\n'
+      fi
+    } > "$curl_config"
+  )
+
+  if ! curl -K "$curl_config" -w '%{http_code}' > "$status_file"; then
+    rm -f "$curl_config" "$response_file" "$status_file"
+    write_quota_cache_error "$name" "quota request failed"
+    return 1
+  fi
+
+  http_code="$(cat "$status_file")"
+  case "$http_code" in
+    2??)
+      write_quota_cache_from_payload "$name" "$response_file"
+      ;;
+    *)
+      write_quota_cache_error "$name" "quota request returned HTTP $http_code"
+      ;;
+  esac
+
+  rm -f "$curl_config" "$response_file" "$status_file"
+}
+
+update_quota_cache_once() {
+  local requested="${1:-}"
+  local skip_active="${2:-0}"
+  local active=""
+  local entry
+  local name
+  local found=0
+  local status=0
+
+  ensure_store
+  [ -f "$CURRENT_FILE" ] && active="$(cat "$CURRENT_FILE")"
+
+  if [ -n "$requested" ]; then
+    require_profile_name "$requested"
+    [ -d "$(profile_dir "$requested")" ] || die "unknown profile: $requested"
+  fi
+
+  if ! acquire_quota_lock; then
+    write_quota_bar
+    return 0
+  fi
+
+  if [ -n "$requested" ]; then
+    fetch_quota_for_profile "$requested" || status=$?
+    write_quota_bar
+    release_quota_lock
+    return "$status"
+  fi
+
+  for entry in "$STORE"/*; do
+    [ -d "$entry" ] || continue
+    name="$(basename "$entry")"
+    [ "$name" = ".backups" ] && continue
+    if [ "$skip_active" = "1" ] && [ "$name" = "$active" ]; then
+      continue
+    fi
+    found=1
+    fetch_quota_for_profile "$name" || status=$?
+  done
+
+  [ "$found" -eq 1 ] || true
+  write_quota_bar
+  release_quota_lock
+  return "$status"
+}
+
+quota_cache_line() {
+  local file="$1"
+  local active="${2:-}"
+
+  jq -r --arg active "$active" '
+    def repeat_char($ch; $n):
+      if $n <= 0 then "" else reduce range(0; $n) as $i (""; . + $ch) end;
+    def clamp_percent($value):
+      (($value // 0) | tonumber) as $pct
+      | if $pct < 0 then 0 elif $pct > 100 then 100 else $pct end;
+    def progress_bar($remaining):
+      clamp_percent($remaining) as $pct
+      | (($pct / 10) | floor) as $filled
+      | "[" + repeat_char("#"; $filled) + repeat_char("-"; 10 - $filled) + "]";
+    def display_name:
+      if .profile == $active then "*\(.profile)" else .profile end;
+    def reset_prefix:
+      if (.reset_alert.active // false) then "RESET " else "" end;
+    if .status == "ok" then
+      "\(reset_prefix)\(display_name) \(progress_bar(.remaining_percent))\((.remaining_percent // 0) | floor)% \(.window_label // "quota") \(.reset_label // "unknown")"
+    elif .status == "missing" then
+      "\(display_name) unavailable"
+    else
+      "\(display_name) error"
+    end
+  ' "$file" 2>/dev/null || true
+}
+
+quota_reset_alert_active() {
+  local entry
+
+  for entry in "$QUOTA_DIR"/*.json; do
+    [ -f "$entry" ] || continue
+    if jq -e '(.reset_alert.active // false) == true' "$entry" >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+clear_quota_reset_alerts() {
+  local entry
+  local tmp
+
+  ensure_store
+  for entry in "$QUOTA_DIR"/*.json; do
+    [ -f "$entry" ] || continue
+    tmp="$entry.tmp.$$"
+    if jq 'del(.reset_alert)' "$entry" > "$tmp" 2>/dev/null; then
+      chmod 600 "$tmp"
+      mv "$tmp" "$entry"
+    else
+      rm -f "$tmp"
+    fi
+  done
+  write_quota_bar
+}
+
+quota_bar_text() {
+  local active=""
+  local entry
+  local name
+  local line
+  local output=""
+  local count=0
+  local active_entry=""
+
+  ensure_store
+  [ -f "$CURRENT_FILE" ] && active="$(cat "$CURRENT_FILE")"
+
+  if [ -n "$active" ]; then
+    active_entry="$QUOTA_DIR/$active.json"
+    if [ -f "$active_entry" ]; then
+      line="$(quota_cache_line "$active_entry" "$active")"
+      if [ -n "$line" ]; then
+        output="$line"
+        count=1
+      fi
+    fi
+  fi
+
+  for entry in "$QUOTA_DIR"/*.json; do
+    [ -f "$entry" ] || continue
+    name="$(jq -r '.profile // empty' "$entry" 2>/dev/null || true)"
+    [ -n "$name" ] || continue
+    [ "$name" = "$active" ] && continue
+    line="$(quota_cache_line "$entry" "$active")"
+    [ -n "$line" ] || continue
+    if [ "$count" -eq 0 ]; then
+      output="$line"
+    else
+      output="$output  |  $line"
+    fi
+    count=$((count + 1))
+  done
+
+  if [ "$count" -eq 0 ]; then
+    printf 'pending'
+  else
+    printf '%s' "$output"
+  fi
+}
+
+write_quota_bar() {
+  local tmp="$QUOTA_BAR_FILE.tmp.$$"
+
+  quota_bar_text > "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$QUOTA_BAR_FILE"
+}
+
+show_quota() {
+  local requested="${1:-}"
+  local file
+
+  update_quota_cache_once "$requested" 0 >/dev/null 2>&1 || true
+  if [ -n "$requested" ]; then
+    file="$QUOTA_DIR/$requested.json"
+    [ -f "$file" ] && quota_cache_line "$file" "$(cat "$CURRENT_FILE" 2>/dev/null || true)"
+    return
+  fi
+  quota_bar_text
+  printf '\n'
+}
+
+start_quota_monitor() {
+  local existing_pid=""
+
+  [ "$QUOTA_BAR_ENABLED" != "0" ] || return 0
+  ensure_store
+  write_quota_bar
+
+  if [ -f "$QUOTA_PID_FILE" ]; then
+    existing_pid="$(cat "$QUOTA_PID_FILE" 2>/dev/null || true)"
+    if pid_is_running "$existing_pid"; then
+      return 0
+    fi
+    rm -f "$QUOTA_PID_FILE"
+  fi
+
+  command -v jq >/dev/null 2>&1 || return 0
+  command -v curl >/dev/null 2>&1 || return 0
+
+  : > "$QUOTA_LOG_FILE"
+  chmod 600 "$QUOTA_LOG_FILE"
+  if command -v nohup >/dev/null 2>&1; then
+    nohup "$0" _quota-daemon >> "$QUOTA_LOG_FILE" 2>&1 &
+  else
+    "$0" _quota-daemon >> "$QUOTA_LOG_FILE" 2>&1 &
+  fi
+  printf '%s\n' "$!" > "$QUOTA_PID_FILE"
+  chmod 600 "$QUOTA_PID_FILE"
+}
+
+quota_daemon() {
+  local interval
+  local quota_sleep_pid=""
+
+  ensure_store
+  interval="$(quota_interval_seconds)"
+  trap 'rm -f "$QUOTA_PID_FILE"' EXIT
+  trap 'rm -f "$QUOTA_PID_FILE"; [ -z "${quota_sleep_pid:-}" ] || kill "$quota_sleep_pid" 2>/dev/null || true; exit 0' INT TERM
+  printf '%s\n' "$$" > "$QUOTA_PID_FILE"
+  chmod 600 "$QUOTA_PID_FILE"
+
+  while true; do
+    update_quota_cache_once "" 0 || true
+    sleep "$interval" &
+    quota_sleep_pid="$!"
+    wait "$quota_sleep_pid" || true
+    quota_sleep_pid=""
+  done
+}
+
+show_quota_status() {
+  local pid=""
+
+  ensure_store
+  [ -f "$QUOTA_PID_FILE" ] && pid="$(cat "$QUOTA_PID_FILE" 2>/dev/null || true)"
+  if pid_is_running "$pid"; then
+    printf 'running pid=%s\n' "$pid"
+  else
+    printf 'stopped\n'
+  fi
+  printf 'interval_seconds=%s\n' "$(quota_interval_seconds)"
+  printf 'cache_max_age_seconds=%s\n' "$(quota_cache_max_age_seconds)"
+  printf 'lock_max_age_seconds=%s\n' "$(quota_lock_max_age_seconds)"
+  printf 'reset_drop_threshold_percent=%s\n' "$(quota_reset_drop_threshold_percent)"
+  printf 'fetch_timeout_seconds=%s\n' "$(quota_fetch_timeout_seconds)"
+  printf 'overlay_align=%s\n' "$QUOTA_OVERLAY_ALIGN"
+  printf 'overlay_max_width=%s\n' "$(quota_overlay_max_width)"
+  printf 'bar=%s\n' "$QUOTA_BAR_FILE"
+  printf 'lock=%s\n' "$QUOTA_LOCK_FILE"
+  printf 'log=%s\n' "$QUOTA_LOG_FILE"
+}
+
+quota_bar_should_overlay() {
+  case "$QUOTA_BAR_ENABLED" in
+    0|false|FALSE|off|OFF|no|NO)
+      return 1
+      ;;
+    1|true|TRUE|on|ON|yes|YES)
+      [ -t 0 ] && [ -t 1 ]
+      return
+      ;;
+  esac
+
+  [ -t 0 ] && [ -t 1 ] && [ -w /dev/tty ]
+}
+
+draw_quota_overlay_once() {
+  local cols
+  local bar
+  local title='XODEX | Quotas:'
+  local title_len
+  local align="$QUOTA_OVERLAY_ALIGN"
+  local max_width
+  local body_width
+  local body_text
+  local badge_width
+  local start_col
+  local end_col
+  local clear_start
+  local clear_end
+  local clear_width
+  local previous_start=""
+  local previous_width=""
+  local previous_cols=""
+  local previous_text=""
+  local previous_drawn_at=""
+  local previous_end
+  local previous_valid=0
+  local now
+  local line
+  local rest_width
+  local badge_text
+  local alert_active=0
+  local title_bg='48;5;27'
+  local title_fg='38;5;15'
+  local body_bg='48;5;236'
+  local body_fg='38;5;250'
+
+  [ -w /dev/tty ] || return 0
+  cols="$(terminal_cols)"
+  bar="$(quota_bar_text)"
+  if quota_reset_alert_active; then
+    alert_active=1
+    if [ $(( $(now_epoch) % 2 )) -eq 0 ]; then
+      title='OPENAI RESET:'
+      title_bg='48;5;196'
+      title_fg='38;5;15'
+      body_bg='48;5;52'
+      body_fg='38;5;226'
+    else
+      title='OPENAI RESET:'
+      title_bg='48;5;226'
+      title_fg='38;5;16'
+      body_bg='48;5;196'
+      body_fg='38;5;15'
+    fi
+  fi
+  title_len="${#title}"
+
+  case "$align" in
+    full|FULL)
+      if [ "$cols" -le "$title_len" ]; then
+        printf '\0337\033[1;1H\033[%sm\033[%sm\033[1m%-*.*s\033[0m\0338' "$title_bg" "$title_fg" "$cols" "$cols" "$title" >/dev/tty
+        return 0
+      fi
+      rest_width=$((cols - title_len))
+      {
+        printf '\0337\033[1;1H'
+        printf '\033[%sm\033[%sm\033[1m%-*.*s' "$title_bg" "$title_fg" "$title_len" "$title_len" "$title"
+        printf '\033[%sm\033[%sm %-*.*s\033[0m\0338' "$body_bg" "$body_fg" "$((rest_width - 1))" "$((rest_width - 1))" "$bar"
+      } >/dev/tty
+      return 0
+      ;;
+  esac
+
+  max_width="$(quota_overlay_max_width)"
+  if [ "$max_width" -le 0 ]; then
+    max_width="$cols"
+  fi
+  [ "$max_width" -gt "$cols" ] && max_width="$cols"
+  [ "$max_width" -lt "$title_len" ] && max_width="$title_len"
+
+  body_width=$((max_width - title_len - 1))
+  if [ "$body_width" -le 0 ]; then
+    body_text=""
+  elif [ "${#bar}" -gt "$body_width" ]; then
+    if [ "$body_width" -gt 3 ]; then
+      body_text="${bar:0:$((body_width - 3))}..."
+    else
+      body_text="${bar:0:$body_width}"
+    fi
+  else
+    body_text="$bar"
+  fi
+
+  badge_width="$title_len"
+  if [ -n "$body_text" ]; then
+    badge_width=$((badge_width + 1 + ${#body_text}))
+  fi
+  start_col=$((cols - badge_width + 1))
+  [ "$start_col" -lt 1 ] && start_col=1
+  end_col=$((start_col + badge_width - 1))
+  clear_start="$start_col"
+  clear_end="$end_col"
+
+  if [ -f "$QUOTA_OVERLAY_STATE_FILE" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        start=*) previous_start="${line#*=}" ;;
+        width=*) previous_width="${line#*=}" ;;
+        cols=*) previous_cols="${line#*=}" ;;
+        text=*) previous_text="${line#*=}" ;;
+        drawn_at=*) previous_drawn_at="${line#*=}" ;;
+      esac
+    done < "$QUOTA_OVERLAY_STATE_FILE"
+    case "$previous_start" in
+      ""|*[!0-9]*) previous_width="" ;;
+    esac
+    case "$previous_width" in
+      ""|*[!0-9]*) ;;
+      *)
+        previous_valid=1
+        [ "$previous_start" -lt "$clear_start" ] && clear_start="$previous_start"
+        previous_end=$((previous_start + previous_width - 1))
+        [ "$previous_end" -gt "$clear_end" ] && clear_end="$previous_end"
+        ;;
+    esac
+  fi
+  [ "$clear_end" -gt "$cols" ] && clear_end="$cols"
+  clear_width=$((clear_end - clear_start + 1))
+  badge_text="$title $body_text"
+  now="$(now_epoch)"
+
+  if [ "$alert_active" -eq 0 ] && [ "$previous_valid" -eq 1 ] && [ "$previous_cols" = "$cols" ] && [ "$previous_text" = "$badge_text" ]; then
+    case "$previous_drawn_at" in
+      ""|*[!0-9]*) ;;
+      *)
+        if [ $((now - previous_drawn_at)) -lt 30 ]; then
+          return 0
+        fi
+        ;;
+    esac
+  fi
+
+  {
+    printf '\0337'
+    printf '\033[1;%sH\033[0m%-*s' "$clear_start" "$clear_width" ""
+    printf '\033[1;%sH' "$start_col"
+    printf '\033[%sm\033[%sm\033[1m%s' "$title_bg" "$title_fg" "$title"
+    if [ -n "$body_text" ]; then
+      printf '\033[%sm\033[%sm %s' "$body_bg" "$body_fg" "$body_text"
+    fi
+    printf '\033[0m\0338'
+  } >/dev/tty
+
+  {
+    printf 'start=%s\n' "$start_col"
+    printf 'width=%s\n' "$badge_width"
+    printf 'cols=%s\n' "$cols"
+    printf 'text=%s\n' "$badge_text"
+    printf 'drawn_at=%s\n' "$now"
+  } > "$QUOTA_OVERLAY_STATE_FILE"
+  chmod 600 "$QUOTA_OVERLAY_STATE_FILE"
+}
+
+clear_quota_overlay() {
+  local cols
+  local start=""
+  local width=""
+  local line
+
+  [ -w /dev/tty ] || return 0
+  cols="$(terminal_cols)"
+  if [ -f "$QUOTA_OVERLAY_STATE_FILE" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        start=*) start="${line#*=}" ;;
+        width=*) width="${line#*=}" ;;
+      esac
+    done < "$QUOTA_OVERLAY_STATE_FILE"
+  fi
+  case "$start" in
+    ""|*[!0-9]*) return 0 ;;
+  esac
+  case "$width" in
+    ""|*[!0-9]*) return 0 ;;
+  esac
+  [ "$start" -lt 1 ] && start=1
+  [ "$start" -gt "$cols" ] && return 0
+  [ $((start + width - 1)) -gt "$cols" ] && width=$((cols - start + 1))
+  printf '\0337\033[1;%sH\033[0m%-*s\0338' "$start" "$width" "" >/dev/tty
+  rm -f "$QUOTA_OVERLAY_STATE_FILE"
+}
+
+quota_overlay_loop() {
+  local parent_pid="${1:-}"
+
+  trap 'exit 0' INT TERM HUP
+  while true; do
+    if [ -n "$parent_pid" ] && ! pid_is_running "$parent_pid"; then
+      exit 0
+    fi
+    draw_quota_overlay_once
+    if quota_reset_alert_active; then
+      sleep 1
+    else
+      sleep 5
+    fi
+  done
+}
+
+cleanup_quota_overlay_pid() {
+  local pid="${1:-}"
+
+  if pid_is_running "$pid"; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  fi
+  clear_quota_overlay
+}
+
+run_codex_command() {
+  local overlay_pid=""
+  local parent_pid
+  local status
+
+  if quota_bar_should_overlay; then
+    start_quota_monitor
+    parent_pid="${BASHPID:-$$}"
+    quota_overlay_loop "$parent_pid" &
+    overlay_pid="$!"
+    trap 'cleanup_quota_overlay_pid "$overlay_pid"; exit 130' INT
+    trap 'cleanup_quota_overlay_pid "$overlay_pid"; exit 143' TERM
+    trap 'cleanup_quota_overlay_pid "$overlay_pid"; exit 129' HUP
+    trap 'cleanup_quota_overlay_pid "$overlay_pid"' EXIT
+    set +e
+    "$CODEX_BIN" "$@"
+    status=$?
+    set -e
+    cleanup_quota_overlay_pid "$overlay_pid"
+    overlay_pid=""
+    trap - EXIT INT TERM HUP
+    return "$status"
+  fi
+
+  set +e
+  "$CODEX_BIN" "$@"
+  status=$?
+  set -e
+  return "$status"
+}
+
+pid_is_running() {
+  local pid="$1"
+
+  case "$pid" in
+    ""|*[!0-9]*)
+      return 1
+      ;;
+  esac
+  kill -0 "$pid" >/dev/null 2>&1
+}
+
+read_refresh_lock_field() {
+  local key="$1"
+  local line
+
+  [ -f "$REFRESH_LOCK_FILE" ] || return 1
+  while IFS= read -r line; do
+    case "$line" in
+      "$key="*)
+        printf '%s\n' "${line#*=}"
+        return 0
+        ;;
+    esac
+  done < "$REFRESH_LOCK_FILE"
+
+  return 1
+}
+
+acquire_refresh_lock() {
+  local now
+  local max_age
+  local lock_created
+  local lock_pid
+  local lock_owner
+  local age
+
+  ensure_store
+  max_age="$(refresh_lock_max_age_seconds)"
+
+  while true; do
+    now="$(now_epoch)"
+    REFRESH_LOCK_OWNER="$$:${BASHPID:-$$}:$RANDOM:$now"
+    if (
+      set -o noclobber
+      umask 077
+      {
+        printf 'owner=%s\n' "$REFRESH_LOCK_OWNER"
+        printf 'pid=%s\n' "$$"
+        printf 'created_at=%s\n' "$now"
+      } > "$REFRESH_LOCK_FILE"
+    ) 2>/dev/null; then
+      return 0
+    fi
+
+    lock_created="$(read_refresh_lock_field created_at 2>/dev/null || true)"
+    lock_pid="$(read_refresh_lock_field pid 2>/dev/null || true)"
+    lock_owner="$(read_refresh_lock_field owner 2>/dev/null || true)"
+
+    case "$lock_created" in
+      ""|*[!0-9]*)
+        age="$max_age"
+        ;;
+      *)
+        age=$((now - lock_created))
+        ;;
+    esac
+
+    if [ "$age" -ge "$max_age" ]; then
+      log_refresh "Ignoring stale refresh lock owner=${lock_owner:-unknown} pid=${lock_pid:-unknown} age=${age}s max_age=${max_age}s"
+      rm -f "$REFRESH_LOCK_FILE"
+      continue
+    fi
+
+    log_refresh "Refresh already running owner=${lock_owner:-unknown} pid=${lock_pid:-unknown} age=${age}s"
+    return 1
+  done
+}
+
+release_refresh_lock() {
+  local lock_owner
+
+  [ -f "$REFRESH_LOCK_FILE" ] || return 0
+  lock_owner="$(read_refresh_lock_field owner 2>/dev/null || true)"
+  if [ -n "${REFRESH_LOCK_OWNER:-}" ] && [ "$lock_owner" = "$REFRESH_LOCK_OWNER" ]; then
+    rm -f "$REFRESH_LOCK_FILE"
+  fi
+}
+
+start_refresher() {
+  local existing_pid=""
+
+  [ "$REFRESH_ENABLED" != "0" ] || return 0
+  ensure_store
+
+  if [ -f "$REFRESH_PID_FILE" ]; then
+    existing_pid="$(cat "$REFRESH_PID_FILE" 2>/dev/null || true)"
+    if pid_is_running "$existing_pid"; then
+      return 0
+    fi
+    rm -f "$REFRESH_PID_FILE"
+  fi
+
+  command -v jq >/dev/null 2>&1 || {
+    printf 'xodex: background refresh disabled because jq is not installed\n' >&2
+    return 0
+  }
+  command -v curl >/dev/null 2>&1 || {
+    printf 'xodex: background refresh disabled because curl is not installed\n' >&2
+    return 0
+  }
+
+  : > "$REFRESH_LOG_FILE"
+  chmod 600 "$REFRESH_LOG_FILE"
+  if command -v nohup >/dev/null 2>&1; then
+    nohup "$0" _refresh-daemon >> "$REFRESH_LOG_FILE" 2>&1 &
+  else
+    "$0" _refresh-daemon >> "$REFRESH_LOG_FILE" 2>&1 &
+  fi
+  printf '%s\n' "$!" > "$REFRESH_PID_FILE"
+  chmod 600 "$REFRESH_PID_FILE"
+}
+
+refresh_daemon() {
+  local interval
+  local refresh_sleep_pid=""
+
+  ensure_store
+  interval="$(refresh_interval_seconds)"
+
+  trap 'release_refresh_lock; rm -f "$REFRESH_PID_FILE"' EXIT
+  trap 'release_refresh_lock; rm -f "$REFRESH_PID_FILE"; [ -z "${refresh_sleep_pid:-}" ] || kill "$refresh_sleep_pid" 2>/dev/null || true; exit 0' INT TERM
+  printf '%s\n' "$$" > "$REFRESH_PID_FILE"
+  chmod 600 "$REFRESH_PID_FILE"
+  log_refresh "Refresh daemon started; interval=${interval}s"
+
+  while true; do
+    refresh_saved_profiles_once "" 1 || true
+    sleep "$interval" &
+    refresh_sleep_pid="$!"
+    wait "$refresh_sleep_pid" || true
+    refresh_sleep_pid=""
+  done
+}
+
+show_refresh_status() {
+  local pid=""
+
+  ensure_store
+  [ -f "$REFRESH_PID_FILE" ] && pid="$(cat "$REFRESH_PID_FILE" 2>/dev/null || true)"
+  if pid_is_running "$pid"; then
+    printf 'running pid=%s\n' "$pid"
+  else
+    printf 'stopped\n'
+  fi
+  printf 'interval_seconds=%s\n' "$(refresh_interval_seconds)"
+  printf 'refresh_window_seconds=%s\n' "$(refresh_window_seconds)"
+  printf 'lock_max_age_seconds=%s\n' "$(refresh_lock_max_age_seconds)"
+  printf 'lock=%s\n' "$REFRESH_LOCK_FILE"
+  printf 'log=%s\n' "$REFRESH_LOG_FILE"
+}
+
+run_codex_with_profile() {
+  local name="$1"
+  local status
+
+  shift
+  require_profile_name "$name"
+  use_profile "$name"
+  if command -v jq >/dev/null 2>&1; then
+    clear_quota_reset_alerts
+  fi
+  start_refresher
+
+  command -v "$CODEX_BIN" >/dev/null 2>&1 || die "codex command not found: $CODEX_BIN"
+  set +e
+  run_codex_command "$@"
+  status=$?
+  set -e
+  autosave_current_profile
+  return "$status"
+}
+
+current_profile_name() {
+  local name=""
+
+  ensure_store
+  [ -f "$CURRENT_FILE" ] || die "no current profile is marked; use xodex use <name> or xodex save <name>"
+  name="$(cat "$CURRENT_FILE")"
+  require_profile_name "$name"
+  [ -d "$(profile_dir "$name")" ] || die "current profile is unknown: $name"
+  printf '%s\n' "$name"
+}
+
+run_codex_with_current_profile() {
+  local name
+
+  name="$(current_profile_name)"
+  run_codex_with_profile "$name" "$@"
+}
+
+new_empty_profile() {
+  local name="$1"
+  local target
+  local file
+
+  require_profile_name "$name"
+  require_codex_home
+  ensure_store
+
+  target="$(profile_dir "$name")"
+  [ ! -e "$target" ] || die "profile already exists: $name"
+
+  autosave_current_profile
+  backup_active_profile_files
+
+  mkdir -p "$target"
+  chmod 700 "$target"
+
+  for file in "${PROFILE_FILES[@]}"; do
+    rm -f "$CODEX_HOME/$file" "$target/$file"
+  done
+
+  write_meta "$name" "$target"
+  printf '%s\n' "$name" > "$CURRENT_FILE"
+  chmod 600 "$CURRENT_FILE"
+
+  printf 'Created empty Codex profile %s\n' "$name"
+  printf 'Switched Codex profile to %s\n' "$name"
+  printf 'Active OpenAI login cleared; Codex will need a login for this profile.\n'
+  printf 'Shared config kept in place: %s/config.toml\n' "$CODEX_HOME"
+  printf 'Sessions kept in place: %s/sessions\n' "$CODEX_HOME"
+}
+
+list_profiles() {
+  local current=""
+  local entry
+  local name
+  local found=0
+
+  ensure_store
+  [ -f "$CURRENT_FILE" ] && current="$(cat "$CURRENT_FILE")"
+
+  for entry in "$STORE"/*; do
+    [ -d "$entry" ] || continue
+    name="$(basename "$entry")"
+    [ "$name" = ".backups" ] && continue
+    found=1
+    if [ "$name" = "$current" ]; then
+      printf '* %s\n' "$name"
+    else
+      printf '  %s\n' "$name"
+    fi
+  done
+
+  [ "$found" -eq 1 ] || printf 'No saved profiles in %s\n' "$STORE"
+}
+
+show_current() {
+  if [ -f "$CURRENT_FILE" ]; then
+    cat "$CURRENT_FILE"
+  else
+    printf 'unknown\n'
+  fi
+}
+
+show_where() {
+  printf 'CODEX_HOME=%s\n' "$CODEX_HOME"
+  printf 'PROFILE_STORE=%s\n' "$STORE"
+  printf 'SESSIONS=%s/sessions\n' "$CODEX_HOME"
+  printf 'REFRESH_LOG=%s\n' "$REFRESH_LOG_FILE"
+  printf 'QUOTA_BAR=%s\n' "$QUOTA_BAR_FILE"
+}
+
+main() {
+  local command="${1:-}"
+
+  case "$command" in
+    run)
+      shift
+      run_codex_with_profile "${1:-}" "${@:2}"
+      ;;
+    save|capture)
+      shift
+      save_profile "${1:-}"
+      ;;
+    use|switch)
+      shift
+      use_profile "${1:-}"
+      ;;
+    new|create|empty)
+      shift
+      new_empty_profile "${1:-}"
+      ;;
+    refresh)
+      shift
+      refresh_saved_profiles_once "${1:-}" 0
+      ;;
+    refresh-status|status)
+      show_refresh_status
+      ;;
+    quota)
+      shift
+      show_quota "${1:-}"
+      ;;
+    quota-status)
+      show_quota_status
+      ;;
+    _refresh-daemon)
+      refresh_daemon
+      ;;
+    _quota-daemon)
+      quota_daemon
+      ;;
+    _quota-bar)
+      quota_bar_text
+      ;;
+    list|ls)
+      list_profiles
+      ;;
+    current)
+      show_current
+      ;;
+    where)
+      show_where
+      ;;
+    "")
+      run_codex_with_current_profile
+      ;;
+    help|-h|--help)
+      usage
+      ;;
+    *)
+      if profile_exists "$command"; then
+        run_codex_with_profile "$@"
+      else
+        usage >&2
+        die "unknown command or profile: $command"
+      fi
+      ;;
+  esac
+}
+
+main "$@"
